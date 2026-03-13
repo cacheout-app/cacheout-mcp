@@ -1,0 +1,28 @@
+[project]
+name = "cacheout-mcp"
+version = "0.1.0"
+description = "MCP server for macOS disk cache management — standalone or paired with Cacheout.app"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Daniel", email = "dan@dan.ac"}]
+dependencies = [
+    "mcp[cli]>=1.0.0",
+    "pydantic>=2.0.0",
+]
+
+[project.scripts]
+cacheout-mcp = "cacheout_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: MCP tool functions against real system state (no mocks, no CLI binary validation)",
+    "hardware: manual certification runs on specific hardware tiers",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cacheout_mcp"]
