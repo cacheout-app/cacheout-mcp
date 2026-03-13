@@ -1,15 +1,28 @@
 [project]
 name = "cacheout-mcp"
-version = "0.1.0"
-description = "MCP server for macOS disk cache management — standalone or paired with Cacheout.app"
+version = "2.0.0"
+description = "MCP server for macOS disk cache management and memory telemetry — standalone or paired with Cacheout.app"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
-authors = [{name = "Daniel", email = "dan@dan.ac"}]
+license = {text = "Sustainable Use License v1.0"}
+authors = [{name = "This Local, Inc.", email = "daniel@instantlyeasy.com"}]
+keywords = ["mcp", "macos", "cache", "memory", "disk", "cleanup", "ai-agent"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Systems Administration",
+    "Topic :: Utilities",
+]
 dependencies = [
     "mcp[cli]>=1.0.0",
     "pydantic>=2.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/cacheout-app/cacheout-mcp"
+Repository = "https://github.com/cacheout-app/cacheout-mcp"
+Issues = "https://github.com/cacheout-app/cacheout-mcp/issues"
 
 [project.scripts]
 cacheout-mcp = "cacheout_mcp.server:main"
