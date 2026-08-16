@@ -1,10 +1,11 @@
 [project]
 name = "cacheout-mcp"
-version = "2.0.0"
+dynamic = ["version"]
 description = "MCP server for macOS disk cache management and memory telemetry — standalone or paired with Cacheout.app"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Sustainable Use License v1.0"}
+license-files = ["LICENSE"]
 authors = [{name = "This Local, Inc.", email = "daniel@instantlyeasy.com"}]
 keywords = ["mcp", "macos", "cache", "memory", "disk", "cleanup", "ai-agent"]
 classifiers = [
@@ -30,6 +31,9 @@ cacheout-mcp = "cacheout_mcp.server:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/cacheout_mcp/__init__.py"
 
 [tool.pytest.ini_options]
 markers = [

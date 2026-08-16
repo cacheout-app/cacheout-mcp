@@ -29,13 +29,18 @@ from urllib.parse import urlparse
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from . import __version__
 from .categories import ALL_CATEGORIES, CATEGORY_MAP, RiskLevel
 from .engine import (
     AppEngine,
     CleanResult,
     DiskInfo,
+    ITEM_SCANNER_SLUGS,
     ScanResult,
+    acknowledgement_entry_error,
+    acknowledgement_item_address,
     clean_category,
+    clean_target_error,
     detect_mode,
     get_disk_info,
     scan_all,
@@ -90,6 +95,246 @@ if _MODE == "app":
 print(f"[cacheout-mcp] Mode: {_MODE}", file=sys.stderr)
 
 
+def _disk_engine() -> Optional[AppEngine]:
+    """The engine serving disk/scan/clean, or ``None`` for a local scan.
+
+    AGENTS.md rates disk/scan/clean "Full" in ALL three modes, but the mode
+    ladder made that false: `detect_mode()` checks the daemon socket FIRST
+    and returns before it ever looks for a binary, so `_APP_ENGINE` stays
+    None whenever the daemon is up. Every scanner slug and every
+    `<scanner>:<item-id>` address then fell through to the standalone
+    branch, which has no scanners — so merely STARTING the daemon removed
+    all `build_artifacts` / `orphaned_caches` / `git_worktrees` cleaning,
+    acknowledgement retries included, on a machine with Cacheout.app
+    installed.
+
+    The daemon cannot take over that work: its socket vocabulary is
+    memory/health only — `stats`, `processes`, `compressor`, `health`,
+    `config_status`, `recommendations`, `validate_config`
+    (`Headless/StatusSocket.swift`; PROTOCOL.md "Socket Protocol") — with no
+    scan, clean or disk command in it, and an unknown command comes back
+    `UNKNOWN_COMMAND`. The app binary is the ONLY engine that speaks the
+    schema-4 disk grammar, so socket mode resolves it directly. Socket mode
+    keeps serving MEMORY tools from the daemon; this is the disk path only.
+
+    Resolution order:
+
+    1. `_APP_ENGINE` when startup already built one (app mode) — used as-is,
+       never re-resolved;
+    2. in socket mode ONLY, the binary looked up on demand, mirroring the
+       fallback `cacheout_get_recommendations` already uses for exactly this
+       "socket-started process never initialized `_APP_ENGINE`" case;
+    3. otherwise ``None`` — standalone, where a local scan is the deliberate
+       contract rather than a missing-app accident, so no lookup happens.
+
+    Deliberately uncached. `AppEngine` is stateless by construction and
+    `resolve_cli_timeout` is a pure function of each invocation's argv, so a
+    freshly built engine is indistinguishable from a cached one — and
+    caching would add exactly the cross-invocation state that purity rule
+    exists to forbid.
+    """
+    if _APP_ENGINE is not None:
+        return _APP_ENGINE
+    if _MODE == "socket":
+        binary = _find_cacheout_binary()
+        if binary:
+            return AppEngine(binary)
+    return None
+
+
+# ── Response Normalizers ─────────────────────────────────────────────
+#
+# App mode delegates to the Cacheout CLI binary, which emits its own JSON.
+# Standalone mode builds JSON in Python. These helpers guarantee both modes
+# return an *identical* response contract so MCP clients never have to branch
+# on whether Cacheout.app happens to be installed.
+
+# Canonical per-category keys for the scan response (shared by both modes).
+# Always present, in this order, whatever the source row carried.
+_SCAN_ITEM_KEYS = (
+    "slug", "name", "size_bytes", "size_human",
+    "item_count", "risk_level", "description", "rebuild_note",
+)
+
+# Source-row keys this module CONSUMES rather than forwards. `exists` is the
+# filter input — every surviving row has it True, so echoing it would be
+# noise. Everything else a row carries is forwarded (below).
+_SCAN_ROW_CONSUMED_KEYS = frozenset({"exists"})
+
+# Reverse lookup so the app CLI's name-only clean results can recover a slug.
+_NAME_TO_SLUG = {c.name: c.slug for c in ALL_CATEGORIES}
+
+
+def _category_row(item: dict) -> dict:
+    """One scan row: the canonical keys first, then everything else it had.
+
+    The canonical projection alone was LOSSY against schema 4, whose
+    category rows are field-for-field schema 3's PLUS `state`,
+    `exact_bytes` and `estimated_up_to_bytes` (and, when a scan was
+    impeded, `scan_error` and `grant_hint`). Dropping those hid the
+    measured/estimated split behind the `size_bytes` compatibility sum and
+    hid the fact that a `denied` row's zero is "not measured", not "nothing
+    there" — PROTOCOL.md, `--cli scan`.
+
+    So additive fields are FORWARDED rather than allow-listed: the protocol
+    grows by addition, and an allowlist reproduces exactly this bug the
+    next time it grows. Standalone rows carry only the canonical keys plus
+    `exists`, so that mode's output is byte-identical to before and the two
+    modes still agree on every key either of them can produce.
+    """
+    row = {k: item.get(k) for k in _SCAN_ITEM_KEYS}
+    for key, value in item.items():
+        if key not in row and key not in _SCAN_ROW_CONSUMED_KEYS:
+            row[key] = value
+    return row
+
+
+def _scan_envelope(items: list[dict], min_size_mb: Optional[float]) -> dict:
+    """Build the canonical scan response from a list of category dicts.
+
+    Filters out non-existent categories, applies the optional minimum-size
+    filter, sorts largest-first, projects each row through `_category_row`,
+    and wraps it in the standard envelope. Used by both the app and standalone
+    paths so the output shape is mode-independent.
+    """
+    rows = [i for i in items if i.get("exists", True)]
+    if min_size_mb is not None:
+        min_bytes = int(min_size_mb * 1024 * 1024)
+        rows = [i for i in rows if (i.get("size_bytes") or 0) >= min_bytes]
+    rows.sort(key=lambda i: i.get("size_bytes") or 0, reverse=True)
+    categories = [_category_row(i) for i in rows]
+    # The legacy summary keys stay computed from the compatibility sum, so
+    # the totals mean exactly what they always meant.
+    total_bytes = sum((c["size_bytes"] or 0) for c in categories)
+    return {
+        "total_cleanable": _human_bytes(total_bytes),
+        "total_cleanable_bytes": total_bytes,
+        "category_count": len(categories),
+        "categories": categories,
+    }
+
+
+# Canonical per-result keys for the clean response (shared by both modes).
+_CLEAN_ROW_KEYS = (
+    "slug", "name", "bytes_freed", "freed_human", "success", "error",
+)
+
+# Source keys `_clean_row` CONSUMES to build those canonical keys. Everything
+# else a row carries is forwarded, same discipline as `_category_row`.
+_CLEAN_ROW_CONSUMED_KEYS = frozenset({
+    "category", "bytes_would_free", *(_CLEAN_ROW_KEYS),
+})
+
+# Envelope keys `_normalize_clean_result` consumes; the rest are forwarded.
+_CLEAN_ENVELOPE_CONSUMED_KEYS = frozenset({
+    "results", "total_freed", "total_freed_bytes", "total_would_free",
+    "dry_run",
+})
+
+#: The frozen id cacheout's AGGREGATE category scanner registers under. On a
+#: schema-4 clean row it means "this row is a category aggregate", and then
+#: `item_id` IS the category slug.
+_AGGREGATE_SCANNER_ID = "categories"
+
+
+def _clean_row_slug(item: dict) -> Optional[str]:
+    """The reusable clean-target token for one result row.
+
+    Resolution order, most authoritative first — the identity fields the
+    payload states outright, THEN the legacy inferences:
+
+    1. schema 4's `scanner_id`/`item_id` pair. For an aggregate row
+       (`scanner_id == "categories"`) `item_id` IS the category slug; for a
+       per-item row the token is the `<scanner_id>:<item_id>` address.
+    2. an explicit `slug` (the CLI's dry-run plan rows carry one, already
+       in address form).
+    3. `category`, which schema 4 defines as the retained ADDRESS key — the
+       category slug on aggregate rows, `<scanner>:<item-id>` on per-item
+       rows. Accepted when it is a known slug or an address.
+    4. finally the schema-2/3 fallback: `category` held the DISPLAY NAME
+       back then, so recover the slug by reverse name lookup.
+
+    Name lookup last, not first. It is a guess against a display string
+    this repo maintains independently of the CLI's, it has no answer at all
+    for a per-item row (whose name is `node_modules`, `target`, …), and
+    schema 4 hands us the identity directly — so preferring it discarded
+    good data in favour of a lookup that can only degrade.
+    """
+    scanner_id = item.get("scanner_id")
+    item_id = item.get("item_id")
+    if scanner_id and item_id:
+        if scanner_id == _AGGREGATE_SCANNER_ID:
+            return item_id
+        return f"{scanner_id}:{item_id}"
+
+    explicit = item.get("slug")
+    if explicit:
+        return explicit
+
+    category = item.get("category")
+    if category and (category in CATEGORY_MAP or ":" in category):
+        return category
+
+    return _NAME_TO_SLUG.get(item.get("name") or category or "")
+
+
+def _clean_row(item: dict) -> dict:
+    """One result row: canonical keys, then every additive field it had."""
+    bytes_freed = item.get("bytes_freed")
+    if bytes_freed is None:
+        bytes_freed = item.get("bytes_would_free", 0)
+    row = {
+        "slug": _clean_row_slug(item),
+        "name": item.get("name") or item.get("category", ""),
+        "bytes_freed": bytes_freed,
+        "freed_human": item.get("freed_human", _human_bytes(bytes_freed)),
+        "success": item.get("success", True),
+        "error": item.get("error"),
+    }
+    # Forward the identity fields (`scanner_id`, `item_id`) and every other
+    # additive one the CLI reported — the delete-time `exact_bytes` /
+    # `estimated_up_to_bytes` split, `warning`, and the valuables-refusal
+    # `valuables` / `acknowledgement_token` a caller needs in order to
+    # retry. Allow-listing these is what lost them in the first place.
+    for key, value in item.items():
+        if key not in row and key not in _CLEAN_ROW_CONSUMED_KEYS:
+            row[key] = value
+    return row
+
+
+def _normalize_clean_result(data: dict) -> dict:
+    """Normalize the app CLI's clean output to the standalone clean envelope.
+
+    The CLI emits different shapes for dry-run vs real cleans, so this remaps
+    every variant onto the single standalone contract:
+    ``{total_freed, total_freed_bytes, dry_run, results}`` where each result
+    is ``{slug, name, bytes_freed, freed_human, success, error}``.
+
+    Schema-4 payloads carry MORE than that contract, and the extra is what a
+    caller needs to act again: `scanner_id`/`item_id` identify a per-item row
+    whose `<scanner>:<item-id>` address is directly reusable as a clean
+    target, and the envelope's `schema_version`, `total_estimated_up_to_bytes`
+    and `scanner_rollups` describe the run. Those are forwarded, never
+    projected away — same additive discipline as `_scan_envelope`. Standalone
+    payloads have none of them, so that mode's output is unchanged.
+    """
+    dry = bool(data.get("dry_run", False))
+    results = [_clean_row(item) for item in (data.get("results") or [])]
+    total_bytes = data.get("total_freed_bytes")
+    if total_bytes is None:
+        total_bytes = data.get("total_would_free", 0)
+    envelope = {
+        "total_freed": data.get("total_freed", _human_bytes(total_bytes)),
+        "total_freed_bytes": total_bytes,
+        "dry_run": dry,
+        "results": results,
+    }
+    for key, value in data.items():
+        if key not in envelope and key not in _CLEAN_ENVELOPE_CONSUMED_KEYS:
+            envelope[key] = value
+    return envelope
+
+
 # ── Input Models ─────────────────────────────────────────────────────
 
 class GetDiskUsageInput(BaseModel):
@@ -119,14 +364,21 @@ class ScanCachesInput(BaseModel):
 
 
 class ClearCacheInput(BaseModel):
-    """Input for clearing specific cache categories."""
+    """Input for clearing specific cache targets."""
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     categories: List[str] = Field(
         ...,
         description=(
-            "List of category slugs to clear. REQUIRED. "
-            "Use cacheout_scan_caches first to see available categories and sizes."
+            "List of clean targets. REQUIRED. Each is a category slug "
+            "(e.g. 'npm_cache'), a per-item scanner slug — 'build_artifacts', "
+            "'orphaned_caches', 'git_worktrees' — meaning every item that "
+            "scanner found, or a '<scanner>:<item-id>' address echoed "
+            "verbatim from cacheout_scan_caches' scanner_items (item ids are "
+            "opaque: pass back exactly what the scan printed, never "
+            "construct one). Scanner targets require Cacheout.app; in "
+            "standalone mode only category slugs can be cleaned. "
+            "Use cacheout_scan_caches first to see available targets and sizes."
         ),
         min_length=1,
     )
@@ -134,17 +386,84 @@ class ClearCacheInput(BaseModel):
         default=False,
         description="If true, report what WOULD be cleaned without actually deleting anything.",
     )
+    acknowledge_valuables: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Valuables acknowledgements — ONLY needed to retry a clean that "
+            "was refused. When a result row comes back success=false with a "
+            "'valuables' array and an 'acknowledgement_token', that item "
+            "contains release artifacts (.dmg/.pkg/.ipa/.app/.xcarchive/"
+            ".dSYM) and NOTHING was deleted for it. To retry: show the user "
+            "the 'valuables' list, get their explicit go-ahead, then call "
+            "again with the same target plus one entry here per refused "
+            "item, formed as '<scanner>:<item-id>:<token>' — that row's "
+            "'slug' and its 'acknowledgement_token' joined by a colon. "
+            "Tokens are item-specific and rotate whenever the disclosed set "
+            "changes, so pass exactly what the refusal printed: never "
+            "construct, reuse, or carry one over from an earlier call. If "
+            "the retry is refused again, use the FRESH token from the new "
+            "refusal. A refusal with no 'acknowledgement_token' cannot be "
+            "acknowledged at all — re-scan instead. Requires Cacheout.app."
+        ),
+    )
+
+    @field_validator("acknowledge_valuables")
+    @classmethod
+    def validate_acknowledgements(cls, v: Optional[list[str]]) -> Optional[list[str]]:
+        """Validate entries against the CLI's frozen acknowledgement grammar.
+
+        `acknowledgement_entry_error` (engine.py) owns the grammar and, as
+        with targets, its anchored charset is load-bearing: an entry is
+        passed to the CLI as a FLAG VALUE, so a value able to begin with
+        `-` could be read as a flag and rewrite the invocation.
+
+        Only the locally decidable rules are enforced — entry shape, the
+        address grammar, the token spelling, and one entry per item (a
+        duplicate is refused rather than silently collapsed, since either
+        first-wins or last-wins would drop half of what the caller
+        authorized). Whether a token still MATCHES, and whether the item is
+        part of this clean's selection, are the CLI's to decide against a
+        fresh delete-time inspection; both fail closed there.
+        """
+        if v is None:
+            return v
+
+        errors = [e for e in (acknowledgement_entry_error(x) for x in v) if e]
+        if errors:
+            raise ValueError("; ".join(errors))
+
+        seen: set[str] = set()
+        duplicates = []
+        for address in (acknowledgement_item_address(x) for x in v):
+            if address in seen:
+                duplicates.append(address)
+            seen.add(address)
+        if duplicates:
+            raise ValueError(
+                "one acknowledgement per item; these are named more than "
+                f"once: {', '.join(sorted(set(duplicates)))}"
+            )
+        return v
 
     @field_validator("categories")
     @classmethod
-    def validate_slugs(cls, v: list[str]) -> list[str]:
-        invalid = [s for s in v if s not in CATEGORY_MAP]
-        if invalid:
-            valid = ", ".join(CATEGORY_MAP.keys())
-            raise ValueError(
-                f"Unknown category slug(s): {', '.join(invalid)}. "
-                f"Valid slugs: {valid}"
-            )
+    def validate_targets(cls, v: list[str]) -> list[str]:
+        """Validate against schema 4's target GRAMMAR, not `CATEGORY_MAP`.
+
+        This used to reject every value absent from `CATEGORY_MAP`, which
+        made the scanner findings the scan tool advertises — each with a
+        `<scanner>:<item-id>` address the protocol calls "directly reusable
+        as a clean target token" — impossible to clean through MCP.
+
+        `clean_target_error` (engine.py) owns the grammar. Note it also
+        anchors the token charset, which is load-bearing here: these values
+        become leading POSITIONALS in the argv `AppEngine._run` builds, and
+        a token that could start with `-` would be parsed as a flag by the
+        CLI rather than as a target.
+        """
+        errors = [e for e in (clean_target_error(t) for t in v) if e]
+        if errors:
+            raise ValueError("; ".join(errors))
         return v
 
 
@@ -239,8 +558,9 @@ async def cacheout_get_disk_usage(params: GetDiskUsageInput) -> str:
                 "used_percent": 95.3
             }
     """
-    if _APP_ENGINE:
-        data = await _APP_ENGINE.disk_info()
+    engine = _disk_engine()
+    if engine:
+        data = await engine.disk_info()
         return json.dumps(data, indent=2)
 
     disk = get_disk_info()
@@ -269,62 +589,107 @@ async def cacheout_scan_caches(params: ScanCachesInput) -> str:
         params: Optional filters — specific category slugs or minimum size.
 
     Returns:
-        str: JSON array of cache categories with sizes, sorted largest first.
-            [
-                {
-                    "slug": "xcode_derived_data",
-                    "name": "Xcode DerivedData",
-                    "size_bytes": 15032000000,
-                    "size_human": "15.0 GB",
-                    "item_count": 4230,
-                    "risk_level": "safe",
-                    "description": "Build artifacts...",
-                    "rebuild_note": "Xcode rebuilds on next build"
-                }
-            ]
+        str: JSON object with totals and a categories array, sorted largest first.
+            {
+                "total_cleanable": "15.0 GB",
+                "total_cleanable_bytes": 15032000000,
+                "category_count": 1,
+                "categories": [
+                    {
+                        "slug": "xcode_derived_data",
+                        "name": "Xcode DerivedData",
+                        "size_bytes": 15032000000,
+                        "size_human": "15.0 GB",
+                        "item_count": 4230,
+                        "risk_level": "safe",
+                        "description": "Build artifacts...",
+                        "rebuild_note": "Xcode rebuilds on next build"
+                    }
+                ]
+            }
+        In app mode the same object additionally carries the schema-4 fields,
+        so callers of either contract are satisfied by one payload:
+            {
+                ...the four keys above...,
+                "schema_version": 4,
+                "scanner_items": [...per-item findings, e.g. build_artifacts,
+                                  with opaque item_id clean targets...],
+                "scanner_errors": [...]
+            }
+        and every category row keeps its schema-4 measurement fields —
+        "state" ("missing"/"empty"/"measured"/"partiallyDenied"/"denied"),
+        "exact_bytes" (deletion verifiably frees these) and
+        "estimated_up_to_bytes" (hardlinked; freed only if every other link
+        goes too), whose sum is the legacy "size_bytes". An impeded row also
+        carries "scan_error" and, for TCC denials, "grant_hint": a "denied"
+        row's zero means NOT MEASURED, never "nothing there".
     """
-    if _APP_ENGINE and not params.categories:
-        data = await _APP_ENGINE.scan_all()
-        return json.dumps(data, indent=2)
+    # App/socket mode: ``AppEngine.scan_all()`` returns the schema-4 envelope
+    # ``{schema_version, categories, scanner_items, scanner_errors}``; a
+    # legacy schema-3 bare array is wrapped into that same shape by the
+    # engine, so ``categories`` is always present. Build the unified envelope
+    # from the category rows, then re-attach the schema-4 per-item fields —
+    # dropping them would strip the only handle callers have on scanner
+    # findings, and passing the envelope itself to _scan_envelope() would
+    # iterate its string keys and raise AttributeError.
+    #
+    # A `categories` filter FILTERS THIS ENVELOPE; it no longer diverts to
+    # the local scan. Diverting made a filter change the response CONTRACT:
+    # the result lost `schema_version` and every row's `state`,
+    # `exact_bytes`, `estimated_up_to_bytes`, `scan_error` and `grant_hint`,
+    # so a `denied` row — whose zero means NOT MEASURED — came back looking
+    # like a measured, empty one. Filtering must narrow the rows and change
+    # nothing else.
+    engine = _disk_engine()
+    if engine:
+        data = await engine.scan_all()
+        # Defensive: tolerate a bare list from an engine that predates the
+        # schema-4 wrapping, so this path degrades instead of crashing.
+        if isinstance(data, list):
+            data = {"schema_version": 3, "categories": data}
+        rows = data.get("categories") or []
+        scanner_items = data.get("scanner_items") or []
+        scanner_errors = data.get("scanner_errors") or []
+        if params.categories:
+            # One requested set, applied on each axis by its own identity:
+            # category rows by `slug`, per-item findings and scanner-level
+            # errors by `scanner_id`. So a scanner slug selects that
+            # scanner's items (they are addressable clean targets, and the
+            # local path could only ever drop them), and a category-only
+            # filter carries no unrelated scanner findings.
+            requested = set(params.categories)
+            rows = [r for r in rows if r.get("slug") in requested]
+            scanner_items = [
+                i for i in scanner_items if i.get("scanner_id") in requested
+            ]
+            scanner_errors = [
+                e for e in scanner_errors if e.get("scanner_id") in requested
+            ]
+        envelope = _scan_envelope(rows, params.min_size_mb)
+        envelope["schema_version"] = data.get("schema_version", 4)
+        envelope["scanner_items"] = scanner_items
+        envelope["scanner_errors"] = scanner_errors
+        return json.dumps(envelope, indent=2)
 
-    # Determine which categories to scan
+    # Standalone only: no app binary, so the local registry is the source.
     if params.categories:
         cats = [CATEGORY_MAP[s] for s in params.categories if s in CATEGORY_MAP]
     else:
         cats = ALL_CATEGORIES
 
-    results = [scan_category(c) for c in cats]
-    results.sort(key=lambda r: r.size_bytes, reverse=True)
+    items = [{
+        "slug": r.slug,
+        "name": r.name,
+        "size_bytes": r.size_bytes,
+        "size_human": r.size_human,
+        "item_count": r.item_count,
+        "risk_level": r.risk_level,
+        "description": r.description,
+        "rebuild_note": r.rebuild_note,
+        "exists": r.exists,
+    } for r in (scan_category(c) for c in cats)]
 
-    # Filter by minimum size
-    if params.min_size_mb is not None:
-        min_bytes = int(params.min_size_mb * 1024 * 1024)
-        results = [r for r in results if r.size_bytes >= min_bytes]
-
-    # Format output
-    output = []
-    total_bytes = 0
-    for r in results:
-        if not r.exists:
-            continue
-        total_bytes += r.size_bytes
-        output.append({
-            "slug": r.slug,
-            "name": r.name,
-            "size_bytes": r.size_bytes,
-            "size_human": r.size_human,
-            "item_count": r.item_count,
-            "risk_level": r.risk_level,
-            "description": r.description,
-            "rebuild_note": r.rebuild_note,
-        })
-
-    return json.dumps({
-        "total_cleanable": _human_bytes(total_bytes),
-        "total_cleanable_bytes": total_bytes,
-        "category_count": len(output),
-        "categories": output,
-    }, indent=2)
+    return json.dumps(_scan_envelope(items, params.min_size_mb), indent=2)
 
 
 @mcp.tool(
@@ -338,17 +703,36 @@ async def cacheout_scan_caches(params: ScanCachesInput) -> str:
     },
 )
 async def cacheout_clear_cache(params: ClearCacheInput) -> str:
-    """Clear specific cache categories to free disk space.
+    """Clear specific cache targets to free disk space.
 
-    Removes the contents of the specified cache directories. The directories
-    themselves are preserved — only their contents are deleted. All cleared
-    caches will regenerate automatically when their respective tools are used.
+    For a CATEGORY target the directory itself is preserved — only its
+    contents are deleted — and the cache regenerates when its tool next runs.
+    For a per-item SCANNER target ('build_artifacts', 'orphaned_caches',
+    'git_worktrees', or one '<scanner>:<item-id>' address from a scan) the
+    item's own tree is removed, or reclaimed by its scanner's action.
 
     IMPORTANT: Use cacheout_scan_caches first to see sizes, then pass the
-    slugs of categories you want to clear. Use dry_run=true to preview.
+    targets you want to clear — category slugs from `categories`, and for
+    per-item findings the `scanner_id`/`item_id` of a `scanner_items` row
+    joined as "<scanner_id>:<item_id>". Use dry_run=true to preview.
+
+    Scanner targets are served by Cacheout.app; in standalone mode (no app
+    installed) only category slugs can be cleaned, and anything else comes
+    back as an error naming the unsupported targets.
+
+    REFUSED ITEMS: an item that contains release artifacts is refused — its
+    row comes back success=false carrying "valuables" (what is inside) and,
+    when one exists, "acknowledgement_token". Nothing was deleted for it.
+    Show the user the "valuables" list, and only with their explicit
+    go-ahead retry the same target with acknowledge_valuables=["<that row's
+    slug>:<that row's acknowledgement_token>"], one entry per refused item.
+    Tokens are item-specific and expire the moment the disclosed set
+    changes, so always pass the one the latest refusal printed; a refusal
+    WITHOUT a token cannot be acknowledged at all (re-scan and retry).
 
     Args:
-        params: Categories to clear and whether to dry-run.
+        params: Targets to clear, whether to dry-run, and any valuables
+            acknowledgements the user has explicitly authorized.
 
     Returns:
         str: JSON report of what was cleaned and total space freed.
@@ -367,10 +751,70 @@ async def cacheout_clear_cache(params: ClearCacheInput) -> str:
                     }
                 ]
             }
+        In app mode each row additionally carries whatever schema-4 reported
+        for it — "scanner_id"/"item_id" (a per-item row's "slug" is then its
+        reusable "<scanner>:<item-id>" address), the delete-time
+        "exact_bytes"/"estimated_up_to_bytes" split, and any "warning" —
+        and the envelope carries "schema_version",
+        "total_estimated_up_to_bytes" and "scanner_rollups".
     """
-    if _APP_ENGINE:
-        data = await _APP_ENGINE.clean(params.categories, dry_run=params.dry_run)
-        return json.dumps(data, indent=2)
+    engine = _disk_engine()
+    if engine:
+        # App mode speaks the whole schema-4 grammar: the engine forwards
+        # every target verbatim as a leading positional and the CLI resolves
+        # it. Item ids are opaque and are never parsed on the way through.
+        # Acknowledgements ride along as the CLI's repeatable item-bound
+        # flag; the caller supplies them or they do not exist, because an
+        # acknowledgement is the user's consent and this server never
+        # derives, caches or replays one on their behalf.
+        data = await engine.clean(
+            params.categories,
+            dry_run=params.dry_run,
+            acknowledgements=params.acknowledge_valuables or [],
+        )
+        return json.dumps(_normalize_clean_result(data), indent=2)
+
+    # No app binary: this server runs no scanners itself, so nothing here
+    # can raise the valuables gate and no token it could honour exists.
+    # Refuse rather than drop it: a destructive authorization that silently
+    # lands where nothing reads it is exactly the failure the CLI's own
+    # pre-dispatch flag gate refuses to allow.
+    #
+    # Both refusals below report the mode the server is ACTUALLY in and name
+    # the real cause — Cacheout.app is not installed. Hardcoding
+    # "standalone" told a socket-mode user their daemon had put them in a
+    # mode they were not in, and blamed a fallback for a capability the app
+    # would have provided; the misdescription hid the defect above.
+    if params.acknowledge_valuables:
+        return json.dumps({
+            "error": (
+                "Cacheout.app is not installed, so this server has no "
+                "per-item scanners and no valuables gate — a valuables "
+                "acknowledgement cannot be honoured here and is refused "
+                "rather than ignored. Nothing was cleaned."
+            ),
+            "mode": _MODE,
+            "unhonoured_acknowledgements": list(params.acknowledge_valuables),
+        }, indent=2)
+
+    # Without the app there are no scanners — only the category registry —
+    # so a scanner slug or an addressed item is unsupported HERE rather than
+    # invalid. Say so; `CATEGORY_MAP[slug]` below would otherwise raise
+    # KeyError on a target this server's own validator just accepted.
+    unsupported = [t for t in params.categories if t not in CATEGORY_MAP]
+    if unsupported:
+        return json.dumps({
+            "error": (
+                "Cacheout.app is not installed, so only category slugs can "
+                f"be cleaned. Unsupported target(s): {', '.join(unsupported)}. "
+                "Per-item scanner targets ("
+                f"{', '.join(sorted(ITEM_SCANNER_SLUGS))}, or "
+                "'<scanner>:<item-id>' addresses) require Cacheout.app."
+            ),
+            "mode": _MODE,
+            "unsupported_targets": unsupported,
+            "supported_targets": list(CATEGORY_MAP),
+        }, indent=2)
 
     results = []
     total = 0
@@ -438,8 +882,9 @@ async def cacheout_smart_clean(params: SmartCleanInput) -> str:
                 "skipped": [...]
             }
     """
-    if _APP_ENGINE:
-        data = await _APP_ENGINE.smart_clean(
+    engine = _disk_engine()
+    if engine:
+        data = await engine.smart_clean(
             params.target_gb, dry_run=params.dry_run, include_caution=params.include_caution,
         )
     else:
@@ -460,9 +905,11 @@ async def cacheout_smart_clean(params: SmartCleanInput) -> str:
             }
         else:
             try:
-                if _APP_ENGINE:
+                # Same engine that just did the disk work, so one smart_clean
+                # never splits across two backends mid-operation.
+                if engine:
                     stdout, err = await _async_run(
-                        [_APP_ENGINE.binary, "--cli", "purge"],
+                        [engine.binary, "--cli", "purge"],
                         timeout=_APP_PURGE_TIMEOUT,
                     )
                 else:
@@ -522,7 +969,7 @@ async def cacheout_status(params: ServerStatusInput) -> str:
     return json.dumps({
         "mode": _MODE,
         "binary": _find_cacheout_binary() if _MODE == "app" else None,
-        "version": "0.1.0",
+        "version": __version__,
         "categories": categories,
     }, indent=2)
 

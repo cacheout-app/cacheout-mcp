@@ -2,9 +2,3 @@
 .DS_Store
 .flow
 tests/__pycache__/
-__pycache__/
-*.pyc
-.venv/
-*.egg-info/
-CLAUDE.md
-AGENTS.md
